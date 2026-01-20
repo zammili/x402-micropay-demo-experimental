@@ -50,18 +50,18 @@ The endpoint `/api/verify` handles transaction proof verification.
 
 ```json
 {
-  "transactionHash": "0x..."
+  "txHash": "0x..."
 }
 ```
 
-**Response Body (Verified):**
+**Response Body (Success - 200 OK):**
 
 ```json
 {
   "verified": true,
-  "source": "on-chain" | "cache",
-  "blockNumber": "123456" // or expiresIn: 1234 (if from cache)
+  "source": "on-chain",
+  "blockNumber": "123456" // Returned on success
 }
 ```
 
-The server uses an in-memory cache with a default TTL of 1 hour (configurable via `PROOF_TTL`) to prevent redundant on-chain lookups for the same transaction hash.
+The server uses an in-memory cache with a default TTL of 1 hour (configurable via `PROOF_TTL`) to prevent **replay attacks**. If a transaction hash is verified and then submitted again within the TTL, the server will return a **409 Conflict** response.

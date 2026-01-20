@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server';
 import { createPublicClient, http } from 'viem';
 import { baseSepolia } from 'viem/chains';
 
-// In-memory cache for proof verification
-const proofCache = new Map<string, { timestamp: number; status: boolean }>();
+// In-memory cache for proof verification to prevent replay attacks
+const usedProofs = new Map<string, { timestamp: number; status: boolean }>();
 const PROOF_TTL = parseInt(process.env.PROOF_TTL || '3600', 10); // Default 1 hour
 
 const publicClient = createPublicClient({
@@ -13,32 +13,33 @@ const publicClient = createPublicClient({
 
 export async function POST(request: Request) {
   try {
-    const { transactionHash } = await request.json();
+    const { txHash } = await request.json();
 
-    if (!transactionHash) {
-      return NextResponse.json({ error: 'Missing transactionHash' }, { status: 400 });
+    if (!txHash) {
+      return NextResponse.json({ error: 'Missing txHash' }, { status: 400 });
     }
 
-    // Check cache
-    const cached = proofCache.get(transactionHash);
+    // Check if this proof has already been used (Replay Attack Prevention)
+    const existingProof = usedProofs.get(txHash);
     const now = Math.floor(Date.now() / 1000);
-    if (cached && (now - cached.timestamp) < PROOF_TTL) {
+    
+    if (existingProof && (now - existingProof.timestamp) < PROOF_TTL) {
       return NextResponse.json({ 
-        verified: cached.status, 
-        source: 'cache',
-        expiresIn: PROOF_TTL - (now - cached.timestamp)
-      });
+        error: 'Replay attack detected: This transaction hash has already been used.',
+        verified: existingProof.status,
+        usedAt: existingProof.timestamp
+      }, { status: 409 }); // 409 Conflict
     }
 
     // Verify on-chain
     const receipt = await publicClient.waitForTransactionReceipt({ 
-      hash: transactionHash 
+      hash: txHash as `0x${string}`
     });
 
     const isVerified = receipt.status === 'success';
 
-    // Update cache
-    proofCache.set(transactionHash, {
+    // Store in usedProofs cache
+    usedProofs.set(txHash, {
       timestamp: now,
       status: isVerified
     });
@@ -51,6 +52,6 @@ export async function POST(request: Request) {
 
   } catch (error) {
     console.error('Verification error:', error);
-    return NextResponse.json({ error: 'Verification failed' }, { status: 500 });
+    return NextResponse.json({ error: 'Verification failed or transaction not found' }, { status: 500 });
   }
 }
