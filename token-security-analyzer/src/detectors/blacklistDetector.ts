@@ -1,54 +1,19 @@
-import { AbstractDetector } from './abstractDetector';
+// blacklistDetector.ts
 
-/**
- * BlacklistDetector class detects blacklist, whitelist,
- * and anti-bot patterns in smart contracts.
- */
-class BlacklistDetector extends AbstractDetector {
-    constructor(contract) {
-        super(contract);
-    }
+// Import necessary libraries or modules if needed
 
-    detect() {
-        const patterns = this.analyzeContract();
-        const results = this.checkPatterns(patterns);
-        return results;
-    }
-
-    analyzeContract() {
-        // Logic to analyze the smart contract
-        // This method should return potential patterns found in the contract.
-        return [];
-    }
-
-    checkPatterns(patterns) {
-        const results = [];
-        for (const pattern of patterns) {
-            if (this.isBlacklistPattern(pattern)) {
-                results.push({ pattern, type: 'blacklist' });
-            } else if (this.isWhitelistPattern(pattern)) {
-                results.push({ pattern, type: 'whitelist' });
-            } else if (this.isAntiBotPattern(pattern)) {
-                results.push({ pattern, type: 'anti-bot' });
-            }
-        }
-        return results;
-    }
-
-    isBlacklistPattern(pattern) {
-        // Implement logic to recognize blacklist patterns
-        return false;
-    }
-
-    isWhitelistPattern(pattern) {
-        // Implement logic to recognize whitelist patterns
-        return false;
-    }
-
-    isAntiBotPattern(pattern) {
-        // Implement logic to recognize anti-bot patterns
-        return false;
-    }
+// A function to detect if a token is in the blacklist
+function isTokenBlacklisted(token: string, blacklist: string[]): boolean {
+    return blacklist.includes(token);
 }
 
-export default BlacklistDetector;
+// Example usage
+const blacklist = ['badToken1', 'badToken2', 'badToken3'];
+const tokenToCheck = 'someToken';
+const isBlacklisted = isTokenBlacklisted(tokenToCheck, blacklist);
+
+if (isBlacklisted) {
+    console.log(`Token ${tokenToCheck} is blacklisted.`);
+} else {
+    console.log(`Token ${tokenToCheck} is not blacklisted.`);
+}
