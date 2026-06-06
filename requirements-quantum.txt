@@ -1,4 +1,4 @@
-# Quantum-Resistant Cryptography Requirements
+# Quantum-Resistant Casper Cryptography Requirements
 
 # Core dependencies
 Flask==3.0.0
@@ -11,9 +11,8 @@ pycryptodome==3.18.0
 liboqs==0.9.0
 liboqs-python==0.9.0
 
-# Solana SDK
-solana==0.32.0
-solders==0.20.0
+# Casper RPC client
+httpx==0.26.0
 
 # Data handling
 pydantic==2.5.0
