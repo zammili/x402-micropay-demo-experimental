@@ -1,57 +1,71 @@
 import { NextResponse } from 'next/server';
-import { createPublicClient, http } from 'viem';
-import { baseSepolia } from 'viem/chains';
 
-// In-memory cache for proof verification to prevent replay attacks
 const usedProofs = new Map<string, { timestamp: number; status: boolean }>();
-const PROOF_TTL = parseInt(process.env.PROOF_TTL || '3600', 10); // Default 1 hour
+const PROOF_TTL = parseInt(process.env.PROOF_TTL || '3600', 10);
+const CASPER_RPC_URL = process.env.CASPER_RPC_URL || 'https://rpc.testnet.casperlabs.io';
 
-const publicClient = createPublicClient({
-  chain: baseSepolia,
-  transport: http(),
-});
+function deploySucceeded(executionResults: unknown): boolean {
+  if (!Array.isArray(executionResults)) return false;
+  return executionResults.some((item) => {
+    if (typeof item !== 'object' || item === null) return false;
+    const result = (item as { result?: Record<string, unknown> }).result;
+    if (!result) return false;
+    return 'Success' in result || result.status === 'success';
+  });
+}
 
 export async function POST(request: Request) {
   try {
-    const { txHash } = await request.json();
+    const { deployHash } = await request.json();
 
-    if (!txHash) {
-      return NextResponse.json({ error: 'Missing txHash' }, { status: 400 });
+    if (!deployHash || typeof deployHash !== 'string') {
+      return NextResponse.json({ error: 'Missing deployHash' }, { status: 400 });
     }
 
-    // Check if this proof has already been used (Replay Attack Prevention)
-    const existingProof = usedProofs.get(txHash);
+    const normalizedHash = deployHash.replace(/^0x/, '');
+    const existingProof = usedProofs.get(normalizedHash);
     const now = Math.floor(Date.now() / 1000);
-    
-    if (existingProof && (now - existingProof.timestamp) < PROOF_TTL) {
-      return NextResponse.json({ 
-        error: 'Replay attack detected: This transaction hash has already been used.',
-        verified: existingProof.status,
-        usedAt: existingProof.timestamp
-      }, { status: 409 }); // 409 Conflict
+
+    if (existingProof && now - existingProof.timestamp < PROOF_TTL) {
+      return NextResponse.json(
+        {
+          error: 'Replay attack detected: this Casper deploy hash has already been used.',
+          verified: existingProof.status,
+          usedAt: existingProof.timestamp,
+        },
+        { status: 409 },
+      );
     }
 
-    // Verify on-chain
-    const receipt = await publicClient.waitForTransactionReceipt({ 
-      hash: txHash as `0x${string}`
+    const rpcResponse = await fetch(CASPER_RPC_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'info_get_deploy',
+        params: { deploy_hash: normalizedHash },
+        id: 1,
+      }),
     });
 
-    const isVerified = receipt.status === 'success';
+    if (!rpcResponse.ok) {
+      return NextResponse.json({ error: 'Casper RPC request failed' }, { status: 502 });
+    }
 
-    // Store in usedProofs cache
-    usedProofs.set(txHash, {
-      timestamp: now,
-      status: isVerified
+    const rpcJson = await rpcResponse.json();
+    const executionResults = rpcJson?.result?.execution_results;
+    const isVerified = deploySucceeded(executionResults);
+
+    usedProofs.set(normalizedHash, { timestamp: now, status: isVerified });
+
+    return NextResponse.json({
+      verified: isVerified,
+      source: 'casper-info_get_deploy',
+      chain: 'casper',
+      deployHash: normalizedHash,
     });
-
-    return NextResponse.json({ 
-      verified: isVerified, 
-      source: 'on-chain',
-      blockNumber: receipt.blockNumber.toString()
-    });
-
   } catch (error) {
-    console.error('Verification error:', error);
-    return NextResponse.json({ error: 'Verification failed or transaction not found' }, { status: 500 });
+    console.error('Casper verification error:', error);
+    return NextResponse.json({ error: 'Verification failed or deploy not found' }, { status: 500 });
   }
 }

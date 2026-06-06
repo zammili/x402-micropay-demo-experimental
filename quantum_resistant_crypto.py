@@ -41,7 +41,7 @@ QUANTUM_ENABLED = os.getenv("QUANTUM_ENABLED", "true").lower() in ("1", "true", 
 USE_HYBRID_MODE = os.getenv("USE_HYBRID_MODE", "true").lower() in ("1", "true", "yes")
 QUANTUM_ALGORITHM = os.getenv("QUANTUM_ALGORITHM", "ML-KEM-768")  # or ML-DSA-65, SPHINCS+
 PAYMENT_ADDRESS_STR = os.getenv("PAYMENT_ADDRESS", "YourAddressHere")
-PRICE_SOL = Decimal(os.getenv("PRICE_SOL", "0.001"))
+PRICE_CSPR = Decimal(os.getenv("PRICE_CSPR", "0.001"))
 QUANTUM_KEY_TTL = int(os.getenv("QUANTUM_KEY_TTL", "86400"))  # 24 hours
 
 # Quantum proof cache (prevent replays)
@@ -110,7 +110,7 @@ class QuantumResistantPaymentProof:
     def create_payment_commitment(
         self,
         transaction_hash: str,
-        amount_lamports: int,
+        amount_motes: int,
         payment_address: str,
         timestamp: Optional[float] = None
     ) -> str:
@@ -119,8 +119,8 @@ class QuantumResistantPaymentProof:
         Uses SHA-256 + BLAKE2b for double-hashing resilience.
         
         Args:
-            transaction_hash: Solana transaction hash
-            amount_lamports: Amount in lamports
+            transaction_hash: Casper deploy hash
+            amount_motes: Amount in motes (Casper smallest denomination)
             payment_address: Recipient wallet address
             timestamp: Block timestamp (uses current time if None)
         
@@ -133,7 +133,7 @@ class QuantumResistantPaymentProof:
         # Create structured commitment
         commitment_data = (
             f"{transaction_hash}|"
-            f"{amount_lamports}|"
+            f"{amount_motes}|"
             f"{payment_address}|"
             f"{int(timestamp)}"
         ).encode()

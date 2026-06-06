@@ -2,184 +2,100 @@
 """
 research_agent_quantum.py
 
-Client agent that:
-- Requests translations
-- Handles 402 Payment Required responses
-- Generates quantum-resistant payment proofs
-- Supports ALL Solana networks (testnet, mainnet, devnet)
+Casper client agent that combines x402 payment receipts with a
+quantum-resistant payment commitment.
 """
-import os
-import sys
+from __future__ import annotations
+
+import hashlib
 import json
 import logging
-import requests
+import os
+import sys
+import time
 from decimal import Decimal
+from typing import Any, Dict, Optional
+
+import requests
 
 from quantum_resistant_crypto import QuantumResistantPaymentProof
 
-# Configuration
-AGENT_URL = os.getenv("AGENT_URL", "http://localhost:5002")
+AGENT_URL = os.getenv("AGENT_URL", "http://localhost:5001").rstrip("/")
 TRANSLATION_TEXT = sys.argv[1] if len(sys.argv) > 1 else "Hello world"
-SOLANA_CLUSTER = os.getenv("SOLANA_CLUSTER", "testnet")
+CASPER_CHAIN_NAME = os.getenv("CASPER_CHAIN_NAME", "casper-test")
+CASPER_PAYMENT_ADDRESS = os.getenv("CASPER_PAYMENT_ADDRESS", "account-hash-demo-recipient")
+PRICE_CSPR = Decimal(os.getenv("PRICE_CSPR", "0.001"))
 QUANTUM_ENABLED = os.getenv("QUANTUM_ENABLED", "true").lower() in ("1", "true", "yes")
-USE_HYBRID_MODE = os.getenv("USE_HYBRID_MODE", "true").lower() in ("1", "true", "yes")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def request_translation(text: str) -> dict:
-    """
-    Step 1: Request translation without payment.
-    Expect 402 response with payment requirements.
-    """
-    logger.info("📝 Requesting translation: '%s'", text)
-    
-    try:
-        response = requests.post(
-            f"{AGENT_URL}/translate",
-            json={"text": text},
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            logger.info("✅ Translation succeeded without payment (mock mode?)")
-            return response.json()
-        
-        if response.status_code == 402:
-            logger.info("⏳ Received 402 Payment Required")
-            return response.json()
-        
-        logger.error("❌ Unexpected response: %s", response.status_code)
-        return None
-    
-    except Exception as e:
-        logger.exception("Error requesting translation: %s", e)
-        return None
+def request_translation(text: str) -> Optional[Dict[str, Any]]:
+    logger.info("Requesting Casper translation: %r", text)
+    response = requests.post(f"{AGENT_URL}/translate", json={"text": text}, timeout=10)
+    if response.status_code in (200, 402):
+        return response.json()
+    logger.error("Unexpected response %s: %s", response.status_code, response.text)
+    return None
 
 
-def generate_quantum_proof() -> dict:
-    """
-    Step 2: Generate quantum-resistant payment proof.
-    """
-    logger.info("🔐 Generating quantum-resistant payment proof...")
-    
-    try:
-        qrp = QuantumResistantPaymentProof(enable_quantum=QUANTUM_ENABLED)
-        
-        # Create mock payment commitment
-        commitment = qrp.create_payment_commitment(
-            transaction_hash="5vbX7T2X3Y4Z5a6B7c8D9E0F1G2H3I4J5K6L7M8N9O0P1Q2R3S4T5U",
-            amount_lamports=1_000_000,
-            payment_address="YourTestnetSolanaAddressHere"
-        )
-        
-        # Sign the commitment
-        proof = qrp.sign_payment_proof(commitment)
-        
-        logger.info(
-            "✅ Quantum proof generated (Algo: %s, Hybrid: %s)",
-            proof.get("algorithm"),
-            proof.get("hybrid_mode")
-        )
-        
-        return proof
-    
-    except Exception as e:
-        logger.exception("Error generating quantum proof: %s", e)
-        return None
-
-
-def generate_mock_solana_receipt() -> dict:
-    """
-    Step 2 (Alt): Generate mock Solana on-chain receipt.
-    For testing without real transactions.
-    """
-    logger.info("📋 Generating mock Solana receipt (cluster: %s)...", SOLANA_CLUSTER)
-    
+def generate_mock_casper_receipt(text: str, amount_cspr: Decimal, recipient: str) -> Dict[str, Any]:
+    logger.info("Generating mock Casper deploy receipt (chain=%s)", CASPER_CHAIN_NAME)
+    deploy_hash = "0x" + hashlib.sha256(f"{text}|{amount_cspr}|{time.time_ns()}".encode()).hexdigest()
     return {
-        "transactionHash": "5vbX7T2X3Y4Z5a6B7c8D9E0F1G2H3I4J5K6L7M8N9O0P1Q2R3S4T5U",
-        "blockNumber": 123456789,
-        "status": 1,
-        "cluster": SOLANA_CLUSTER,
-        "amount_lamports": 1_000_000
+        "deployHash": deploy_hash,
+        "chainName": CASPER_CHAIN_NAME,
+        "amount": str(amount_cspr),
+        "toAddress": recipient,
+        "blockTime": int(time.time()),
     }
 
 
-def retry_with_payment(text: str, use_quantum: bool = True) -> dict:
-    """
-    Step 3: Retry translation with payment proof.
-    """
-    logger.info("💳 Retrying with payment proof (Quantum: %s)...", use_quantum)
-    
-    payload = {"text": text}
-    
-    if use_quantum:
-        # Use quantum-resistant proof
-        quantum_proof = generate_quantum_proof()
-        if quantum_proof:
-            payload["quantum_proof"] = quantum_proof
-    else:
-        # Use on-chain mock receipt
-        payment_receipt = generate_mock_solana_receipt()
-        payload["payment_receipt"] = payment_receipt
-    
-    try:
-        response = requests.post(
-            f"{AGENT_URL}/translate",
-            json=payload,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            logger.info("✅ Translation succeeded with payment!")
-            return response.json()
-        
-        if response.status_code == 402:
-            logger.warning("⚠️  Still receiving 402 (payment still invalid)")
-            return response.json()
-        
-        logger.error("❌ Error: %s", response.status_code)
-        return None
-    
-    except Exception as e:
-        logger.exception("Error retrying with payment: %s", e)
-        return None
+def generate_quantum_proof(receipt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    logger.info("Generating quantum-resistant Casper payment proof")
+    qrp = QuantumResistantPaymentProof(enable_quantum=QUANTUM_ENABLED)
+    amount_motes = int(Decimal(str(receipt["amount"])) * Decimal(10**9))
+    commitment = qrp.create_payment_commitment(
+        transaction_hash=receipt["deployHash"],
+        amount_motes=amount_motes,
+        payment_address=receipt["toAddress"],
+    )
+    proof = qrp.sign_payment_proof(commitment)
+    proof["casperDeployHash"] = receipt["deployHash"]
+    proof["chainName"] = receipt["chainName"]
+    return proof
 
 
-def main():
-    """
-    Main workflow:
-    1. Request translation (expect 402)
-    2. Generate payment proof (quantum or on-chain)
-    3. Retry with payment
-    4. Profit!
-    """
-    logger.info("🚀 Starting research agent (Network: %s)", SOLANA_CLUSTER)
-    logger.info("="*60)
-    
-    # Step 1: Request without payment
+def retry_with_payment(text: str, receipt: Dict[str, Any], quantum_proof: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    payload: Dict[str, Any] = {"text": text, "payment_receipt": receipt}
+    if quantum_proof:
+        payload["quantum_proof"] = quantum_proof
+    response = requests.post(f"{AGENT_URL}/translate", json=payload, timeout=10)
+    if response.status_code in (200, 402):
+        return response.json()
+    logger.error("Unexpected retry response %s: %s", response.status_code, response.text)
+    return None
+
+
+def main() -> None:
+    logger.info("Starting quantum-resistant Casper research agent")
     payment_info = request_translation(TRANSLATION_TEXT)
     if not payment_info:
-        logger.error("Failed to request translation")
-        return
-    
+        raise SystemExit(1)
     logger.info("Payment requirements: %s", json.dumps(payment_info, indent=2))
-    
-    # Step 2: Generate payment proof
-    result = retry_with_payment(
-        TRANSLATION_TEXT,
-        use_quantum=QUANTUM_ENABLED
-    )
-    
-    if result:
-        logger.info("="*60)
-        logger.info("🎉 SUCCESS!")
-        logger.info("Result: %s", result.get("result", "N/A"))
-        logger.info("Verification: %s", result.get("verification", "N/A"))
-        logger.info("Network: %s", result.get("network", "N/A"))
-    else:
-        logger.error("Failed to get translation with payment")
+
+    amount = Decimal(str(payment_info.get("amount", PRICE_CSPR)))
+    recipient = payment_info.get("recipient", CASPER_PAYMENT_ADDRESS)
+    receipt = generate_mock_casper_receipt(TRANSLATION_TEXT, amount, recipient)
+    quantum_proof = generate_quantum_proof(receipt)
+    result = retry_with_payment(TRANSLATION_TEXT, receipt, quantum_proof)
+
+    if result and "result" in result:
+        logger.info("Success: %s", result["result"])
+        return
+    logger.error("Payment failed: %s", json.dumps(result or {}, indent=2))
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
