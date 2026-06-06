@@ -11,7 +11,7 @@ import time
 import logging
 from decimal import Decimal, InvalidOperation
 from threading import Lock
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 from flask import Flask, request, jsonify
 
@@ -31,11 +31,24 @@ PROOF_TTL = int(os.getenv("PROOF_TTL", "120"))
 MIN_CONFIRMATIONS = int(os.getenv("MIN_CONFIRMATIONS", "1"))
 PORT = int(os.getenv("PORT", "5001"))
 
+# Valid Casper chains
+VALID_CASPER_CHAINS = {"casper-test", "casper"}
+MAX_TEXT_LENGTH = 10000  # Max translation text length
+
 # Validate configuration
 try:
     PRICE = Decimal(str(PRICE_CSPR))
-except InvalidOperation:
-    raise SystemExit("Invalid PRICE_CSPR")
+    if PRICE < 0:
+        raise ValueError("Price cannot be negative")
+except (ValueError, InvalidOperation) as e:
+    raise SystemExit(f"Invalid PRICE_CSPR: {e}")
+
+if CASPER_CHAIN_NAME not in VALID_CASPER_CHAINS:
+    raise SystemExit(f"Invalid CASPER_CHAIN_NAME: {CASPER_CHAIN_NAME}")
+
+# Validate RPC URL
+if CASPER_RPC_URL and not (CASPER_RPC_URL.startswith("http://") or CASPER_RPC_URL.startswith("https://")):
+    raise SystemExit(f"Invalid CASPER_RPC_URL format: {CASPER_RPC_URL}")
 
 if VERIFY_ONCHAIN and not HTTPX_AVAILABLE:
     logging.warning("VERIFY_ONCHAIN enabled but httpx not available. Falling back to mock verification.")
@@ -63,8 +76,28 @@ def is_deploy_valid(deploy_hash: str) -> bool:
             return False
         if time.time() - ts <= PROOF_TTL:
             return True
-        # Cleanup expired entry
-        del _validated_deploys[deploy_hash]
+        # Safe cleanup - use pop to avoid KeyError
+        _validated_deploys.pop(deploy_hash, None)
+        return False
+
+
+def validate_deploy_hash_format(deploy_hash: str) -> bool:
+    """Validate Casper deploy hash format"""
+    if not isinstance(deploy_hash, str) or not deploy_hash.strip():
+        return False
+    
+    # Remove 0x prefix if present
+    if deploy_hash.startswith("0x") or deploy_hash.startswith("0X"):
+        deploy_hash = deploy_hash[2:]
+    
+    # Validate: must be 64 hex chars (256-bit hash)
+    if len(deploy_hash) != 64:
+        return False
+    
+    try:
+        int(deploy_hash, 16)  # Verify it's valid hex
+        return True
+    except ValueError:
         return False
 
 
@@ -82,28 +115,36 @@ def validate_receipt_mock_casper(receipt: Dict[str, Any]) -> bool:
         logging.error("Invalid or missing deployHash")
         return False
     
-    # Normalize hex (remove 0x prefix if present)
-    deploy_hash = deploy_hash.lstrip("0x")
-    
-    # Validate hex format and length (Casper deploy hash is typically 64 chars)
-    if len(deploy_hash) < 32:
+    # Validate hash format using strict validation
+    if not validate_deploy_hash_format(deploy_hash):
         logging.error("Invalid deploy hash format")
         return False
     
+    # Normalize for replay check
+    if deploy_hash.startswith("0x") or deploy_hash.startswith("0X"):
+        deploy_hash = deploy_hash[2:]
+    
     # Validate chain name
     chain = receipt.get("chainName", CASPER_CHAIN_NAME)
-    if chain != CASPER_CHAIN_NAME:
-        logging.error("Chain mismatch. Expected: %s, Got: %s", CASPER_CHAIN_NAME, chain)
+    if chain not in VALID_CASPER_CHAINS:
+        logging.error("Chain mismatch. Expected one of: %s, Got: %s", VALID_CASPER_CHAINS, chain)
         return False
     
     # Validate amount
     try:
-        amount = Decimal(str(receipt.get("amount", 0)))
+        amount_str = str(receipt.get("amount", 0))
+        if len(amount_str) > 30:
+            logging.error("Amount too large")
+            return False
+        amount = Decimal(amount_str)
+        if amount < 0:
+            logging.error("Amount cannot be negative")
+            return False
         if amount < PRICE:
             logging.error("Insufficient amount: %s < %s", amount, PRICE)
             return False
-    except:
-        logging.error("Invalid amount format")
+    except (ValueError, TypeError, InvalidOperation) as e:
+        logging.error("Invalid amount format: %s", e)
         return False
     
     # Replay attack prevention
@@ -140,8 +181,14 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
         logging.error("Invalid or missing deployHash")
         return False
     
+    # Validate hash format
+    if not validate_deploy_hash_format(deploy_hash):
+        logging.error("Invalid deploy hash format")
+        return False
+    
     # Normalize hex
-    deploy_hash = deploy_hash.lstrip("0x")
+    if deploy_hash.startswith("0x") or deploy_hash.startswith("0X"):
+        deploy_hash = deploy_hash[2:]
     
     # Check if already validated (within TTL)
     if is_deploy_valid(deploy_hash):
@@ -160,7 +207,7 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
                 "id": 1
             }
             
-            response = client.post(CASPER_RPC_URL, json=payload)
+            response = client.post(CASPER_RPC_URL, json=payload, timeout=10.0)
             response.raise_for_status()
             
             result = response.json().get("result", {})
@@ -179,17 +226,27 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
             
             # Verify payment amount
             try:
-                amount = Decimal(str(receipt.get("amount", 0)))
+                amount_str = str(receipt.get("amount", 0))
+                if len(amount_str) > 30:
+                    logging.error("Amount too large")
+                    return False
+                amount = Decimal(amount_str)
+                if amount < 0:
+                    logging.error("Amount cannot be negative")
+                    return False
                 if amount < PRICE:
                     logging.info("Insufficient payment. Received: %s, Required: %s", amount, PRICE)
                     return False
-            except:
-                logging.error("Invalid amount in receipt")
+            except (ValueError, TypeError, InvalidOperation) as e:
+                logging.error("Invalid amount in receipt: %s", e)
                 return False
             
             # Verify recipient address (if configured)
             if CASPER_PAYMENT_ADDRESS:
                 to_address = receipt.get("toAddress", "")
+                if not isinstance(to_address, str):
+                    logging.error("Invalid toAddress format")
+                    return False
                 if to_address != CASPER_PAYMENT_ADDRESS:
                     logging.info("Payment to %s does not match expected %s", to_address, CASPER_PAYMENT_ADDRESS)
                     return False
@@ -199,6 +256,9 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
             logging.info("On-chain validation succeeded for deploy: %s", deploy_hash)
             return True
     
+    except httpx.TimeoutException:
+        logging.error("RPC request timeout")
+        return False
     except httpx.RequestError as e:
         logging.error("RPC request failed: %s", e)
         return False
@@ -232,8 +292,15 @@ def translate():
     text_to_translate = data.get("text", "")
     receipt = data.get("payment_receipt")
     
+    # Validate text input
     if not text_to_translate:
         return jsonify({"error": "Missing 'text' field"}), 400
+    
+    if not isinstance(text_to_translate, str):
+        return jsonify({"error": "Text must be a string"}), 400
+    
+    if len(text_to_translate) > MAX_TEXT_LENGTH:
+        return jsonify({"error": f"Text too long (max {MAX_TEXT_LENGTH} chars)"}), 400
     
     # If payment receipt provided, validate it
     if receipt:
