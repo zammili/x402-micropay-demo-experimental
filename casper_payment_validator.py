@@ -3,7 +3,7 @@
 casper_payment_validator.py
 
 Casper Network on-chain payment validator with:
-- Casper RPC integration via pycspr library
+- Casper RPC integration via httpx library
 - Transaction verification on Casper Testnet
 - Replay attack prevention
 - Deploy/contract interaction validation
@@ -12,7 +12,7 @@ import os
 import logging
 import time
 import threading
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Dict, Any, Optional
 from datetime import datetime
 from enum import Enum
@@ -29,6 +29,25 @@ CASPER_PAYMENT_ADDRESS = os.getenv("CASPER_PAYMENT_ADDRESS", "")  # Casper accou
 PRICE_CSPR = Decimal(os.getenv("PRICE_CSPR", "0.001"))
 TRANSACTION_VALIDITY_WINDOW = int(os.getenv("TRANSACTION_VALIDITY_WINDOW", "3600"))
 CASPER_CHAIN_NAME = os.getenv("CASPER_CHAIN_NAME", "casper-test")
+MAX_AMOUNT_LENGTH = 30  # Prevent decimal overflow attacks
+
+# Validate configuration at startup
+try:
+    PRICE_CSPR = Decimal(str(PRICE_CSPR))
+    if PRICE_CSPR < 0:
+        raise ValueError("PRICE_CSPR must be non-negative")
+except (ValueError, InvalidOperation) as e:
+    raise SystemExit(f"Invalid PRICE_CSPR configuration: {e}")
+
+# Validate RPC URL format
+if CASPER_RPC_URL:
+    if not (CASPER_RPC_URL.startswith("http://") or CASPER_RPC_URL.startswith("https://")):
+        raise SystemExit(f"Invalid CASPER_RPC_URL format: {CASPER_RPC_URL}")
+
+# Valid Casper chains
+VALID_CASPER_CHAINS = {"casper-test", "casper"}
+if CASPER_CHAIN_NAME not in VALID_CASPER_CHAINS:
+    raise SystemExit(f"Invalid CASPER_CHAIN_NAME: {CASPER_CHAIN_NAME}")
 
 # Replay attack prevention
 _validated_deploys = set()
@@ -41,6 +60,34 @@ class CasperTransactionStatus(Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     UNKNOWN = "unknown"
+
+
+def validate_deploy_hash_format(deploy_hash: str) -> bool:
+    """
+    Validate Casper deploy hash format.
+    
+    Args:
+        deploy_hash: Hex string (with or without 0x prefix)
+    
+    Returns:
+        True if valid hex format, False otherwise
+    """
+    if not isinstance(deploy_hash, str) or not deploy_hash.strip():
+        return False
+    
+    # Remove 0x prefix if present
+    if deploy_hash.startswith("0x") or deploy_hash.startswith("0X"):
+        deploy_hash = deploy_hash[2:]
+    
+    # Validate: must be 64 hex chars (256-bit hash)
+    if len(deploy_hash) != 64:
+        return False
+    
+    try:
+        int(deploy_hash, 16)  # Verify it's valid hex
+        return True
+    except ValueError:
+        return False
 
 
 def get_casper_deploy_status(deploy_hash: str) -> Dict[str, Any]:
@@ -57,20 +104,32 @@ def get_casper_deploy_status(deploy_hash: str) -> Dict[str, Any]:
         logging.error("httpx library is not available. Install with: pip install httpx")
         return {}
     
+    if not validate_deploy_hash_format(deploy_hash):
+        logging.error("Invalid deploy hash format: %s", deploy_hash)
+        return {}
+    
     try:
-        with httpx.Client() as client:
-            # Query chain_get_block_transfers
+        with httpx.Client(timeout=10.0) as client:
+            # Query info_get_deploy with the specific deploy hash
             payload = {
                 "jsonrpc": "2.0",
-                "method": "chain_get_block_transfers",
-                "params": {},
+                "method": "info_get_deploy",
+                "params": {
+                    "deploy_hash": deploy_hash.lstrip("0x")
+                },
                 "id": 1
             }
-            response = client.post(CASPER_RPC_URL, json=payload, timeout=10)
+            response = client.post(CASPER_RPC_URL, json=payload, timeout=10.0)
             response.raise_for_status()
             return response.json()
+    except httpx.RequestError as e:
+        logging.error("Network error querying Casper RPC: %s", e)
+        return {}
+    except httpx.TimeoutException:
+        logging.error("RPC request timeout")
+        return {}
     except Exception as e:
-        logging.error("Error querying Casper RPC: %s", e)
+        logging.exception("Error querying Casper RPC: %s", e)
         return {}
 
 
@@ -88,8 +147,12 @@ def get_account_info(account_address: str) -> Dict[str, Any]:
         logging.error("httpx library is not available.")
         return {}
     
+    if not isinstance(account_address, str) or not account_address.strip():
+        logging.error("Invalid account address")
+        return {}
+    
     try:
-        with httpx.Client() as client:
+        with httpx.Client(timeout=10.0) as client:
             payload = {
                 "jsonrpc": "2.0",
                 "method": "state_get_account_info",
@@ -100,11 +163,17 @@ def get_account_info(account_address: str) -> Dict[str, Any]:
                 },
                 "id": 1
             }
-            response = client.post(CASPER_RPC_URL, json=payload, timeout=10)
+            response = client.post(CASPER_RPC_URL, json=payload, timeout=10.0)
             response.raise_for_status()
             return response.json().get("result", {})
+    except httpx.TimeoutException:
+        logging.error("Account info RPC timeout")
+        return {}
+    except httpx.RequestError as e:
+        logging.error("Network error fetching account info: %s", e)
+        return {}
     except Exception as e:
-        logging.error("Error fetching account info: %s", e)
+        logging.exception("Error fetching account info: %s", e)
         return {}
 
 
@@ -139,25 +208,37 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
         logging.error("Invalid or missing deployHash in receipt")
         return False
     
-    # Normalize hex string (remove 0x prefix if present)
-    deploy_hash = deploy_hash.lstrip("0x")
+    # Normalize hex string
+    if deploy_hash.startswith("0x") or deploy_hash.startswith("0X"):
+        deploy_hash = deploy_hash[2:]
     
     # ✅ Step 1: Chain name validation
     receipt_chain = receipt.get("chainName", CASPER_CHAIN_NAME)
-    if receipt_chain != CASPER_CHAIN_NAME:
+    if receipt_chain not in VALID_CASPER_CHAINS:
         logging.error("Chain mismatch. Expected: %s, Got: %s", CASPER_CHAIN_NAME, receipt_chain)
         return False
     
-    # ✅ Step 2: Replay attack prevention
+    # ✅ Step 2: Deploy hash format validation
+    if not validate_deploy_hash_format(deploy_hash):
+        logging.error("Invalid deploy hash format: %s", deploy_hash)
+        return False
+    
+    # ✅ Step 3: Replay attack prevention
     with _deploy_lock:
         if deploy_hash in _validated_deploys:
             logging.warning("Security: Replay attack detected. Deploy already validated: %s", deploy_hash)
             return False
     
     try:
-        # ✅ Step 3: Check deploy timestamp (recency)
+        # ✅ Step 4: Check deploy timestamp (recency)
         block_time = receipt.get("blockTime")
         if block_time:
+            try:
+                block_time = float(block_time)
+            except (ValueError, TypeError):
+                logging.error("Invalid blockTime format: %s", block_time)
+                return False
+                
             time_diff = time.time() - block_time
             if time_diff > TRANSACTION_VALIDITY_WINDOW:
                 logging.warning("Deploy too old (%d seconds): %s", time_diff, deploy_hash)
@@ -166,12 +247,23 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
                 logging.error("Clock skew detected: deploy block_time is in future: %s", deploy_hash)
                 return False
         
-        # ✅ Step 4: Verify sufficient CSPR transfer amount
+        # ✅ Step 5: Verify sufficient CSPR transfer amount
         amount = receipt.get("amount", 0)
+        
+        # Validate amount format and size
+        amount_str = str(amount)
+        if len(amount_str) > MAX_AMOUNT_LENGTH:
+            logging.error("Amount string too large: %s", amount_str[:50])
+            return False
+        
         try:
-            amount_cspr = Decimal(str(amount))
-        except:
-            logging.error("Invalid amount in receipt: %s", amount)
+            amount_cspr = Decimal(amount_str)
+        except (ValueError, TypeError, InvalidOperation) as e:
+            logging.error("Invalid amount in receipt: %s - %s", amount, e)
+            return False
+        
+        if amount_cspr < 0:
+            logging.error("Amount cannot be negative: %s", amount_cspr)
             return False
         
         required_cspr = PRICE_CSPR
@@ -181,9 +273,12 @@ def validate_receipt_onchain_casper(receipt: Dict[str, Any]) -> bool:
                         amount_cspr, required_cspr)
             return False
         
-        # ✅ Step 5: Verify target account matches payment address (if configured)
+        # ✅ Step 6: Verify target account matches payment address (if configured)
         if CASPER_PAYMENT_ADDRESS:
             to_address = receipt.get("toAddress", "")
+            if not isinstance(to_address, str):
+                logging.error("Invalid toAddress format")
+                return False
             if to_address != CASPER_PAYMENT_ADDRESS:
                 logging.info("Payment to %s does not match expected %s", to_address, CASPER_PAYMENT_ADDRESS)
                 return False
@@ -215,11 +310,14 @@ def validate_receipt_mock_casper(receipt: Dict[str, Any]) -> bool:
         logging.error("Invalid or missing deployHash")
         return False
     
-    # Normalize and validate hex format (64 chars for Casper deploy hash)
-    deploy_hash = deploy_hash.lstrip("0x")
-    if len(deploy_hash) < 32:
+    # Validate deploy hash format
+    if not validate_deploy_hash_format(deploy_hash):
         logging.error("Invalid deploy hash format")
         return False
+    
+    # Normalize for replay check
+    if deploy_hash.startswith("0x") or deploy_hash.startswith("0X"):
+        deploy_hash = deploy_hash[2:]
     
     # Replay attack prevention even in mock mode
     with _deploy_lock:
@@ -229,14 +327,21 @@ def validate_receipt_mock_casper(receipt: Dict[str, Any]) -> bool:
         _validated_deploys.add(deploy_hash)
     
     # Validate amount
-    amount = receipt.get("amount", 0)
+    amount_str = str(receipt.get("amount", 0))
+    if len(amount_str) > MAX_AMOUNT_LENGTH:
+        logging.error("Amount too large")
+        return False
+    
     try:
-        amount_cspr = Decimal(str(amount))
+        amount_cspr = Decimal(amount_str)
+        if amount_cspr < 0:
+            logging.error("Amount cannot be negative")
+            return False
         if amount_cspr < PRICE_CSPR:
             logging.error("Insufficient amount: %s < %s", amount_cspr, PRICE_CSPR)
             return False
-    except:
-        logging.error("Invalid amount")
+    except (ValueError, TypeError, InvalidOperation) as e:
+        logging.error("Invalid amount: %s", e)
         return False
     
     logging.info("Mock validation passed for Casper deploy: %s", deploy_hash)
